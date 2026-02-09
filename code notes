@@ -1,0 +1,160 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+
+# -------------------------------
+# Alpaca API credentials
+# -------------------------------
+API_KEY = "YOUR_PAPER_KEY"
+API_SECRET = "YOUR_PAPER_SECRET"
+BASE_URL = "https://paper-api.alpaca.markets"
+
+trading_client = TradingClient(API_KEY, API_SECRET, paper=True)
+data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
+
+# -------------------------------
+# Strategy Parameters
+# -------------------------------
+SYMBOL = "TQQQ"
+CANDLE_TIMEFRAME = TimeFrame.Minute15
+LOOKBACK_BARS = 120  # ~30 hours
+SMA_WINDOW = 20
+STD_WINDOW = 20
+RSI_PERIOD = 14
+DRAWDOWN_THRESHOLD = 0.04
+MEAN_STD_MULTIPLIER = 1.5
+RSI_MAX = 40
+TP_PERCENT = 0.03
+TP_STD_MULT = 0.5
+SL_PERCENT = 0.0125
+MAX_HOLD_BARS = 6
+
+# -------------------------------
+# Helper Functions
+# -------------------------------
+
+def compute_indicators(df):
+    # SMA and rolling std
+    df['SMA'] = df['close'].rolling(SMA_WINDOW).mean()
+    df['STD'] = df['close'].rolling(STD_WINDOW).std()
+    
+    # RSI
+    delta = df['close'].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(RSI_PERIOD).mean()
+    avg_loss = loss.rolling(RSI_PERIOD).mean()
+    RS = avg_gain / avg_loss
+    df['RSI'] = 100 - (100 / (1 + RS))
+    
+    # 24-hour high (96 bars for 15-min candles)
+    df['24h_high'] = df['close'].rolling(96).max()
+    
+    return df
+
+def check_entry_signal(df):
+    # Last completed candle
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    
+    drawdown = (last['close'] / last['24h_high']) - 1 <= -DRAWDOWN_THRESHOLD
+    mean_deviation = last['close'] < last['SMA'] - MEAN_STD_MULTIPLIER * last['STD']
+    rsi_condition = (last['RSI'] <= RSI_MAX) and (last['RSI'] >= prev['RSI'])
+    
+    return drawdown and mean_deviation and rsi_condition
+
+def check_exit_signal(entry_price, current_price, holding_bars, last_candle):
+    tp = current_price >= entry_price * (1 + TP_PERCENT) or \
+         current_price >= last_candle['SMA'] + TP_STD_MULT * last_candle['STD']
+    sl = current_price <= entry_price * (1 - SL_PERCENT)
+    time_stop = holding_bars >= MAX_HOLD_BARS
+    return tp or sl or time_stop
+
+# -------------------------------
+# Main Loop
+# -------------------------------
+
+position_open = False
+entry_price = None
+holding_bars = 0
+
+# For demo, we’ll fetch the latest historical bars once
+bars_request = StockBarsRequest(
+    symbol_or_symbols=SYMBOL,
+    timeframe=CANDLE_TIMEFRAME,
+    start=datetime.now() - timedelta(hours=35),
+    end=datetime.now()
+)
+bars = data_client.get_stock_bars(bars_request)
+df = pd.DataFrame([{
+    'time': b.timestamp,
+    'open': b.open,
+    'high': b.high,
+    'low': b.low,
+    'close': b.close,
+    'volume': b.volume
+} for b in bars[SYMBOL]])
+
+df = compute_indicators(df)
+
+# -------------------------------
+# Trading logic
+# -------------------------------
+last_candle = df.iloc[-1]
+current_price = last_candle['close']
+
+if not position_open:
+    if check_entry_signal(df):
+        # Execute market buy
+        account = trading_client.get_account()
+        qty = int((float(account.cash) * 0.075) / current_price)
+        if qty > 0:
+            order = MarketOrderRequest(
+                symbol=SYMBOL,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY
+            )
+            trading_client.submit_order(order)
+            position_open = True
+            entry_price = current_price
+            holding_bars = 0
+            print(f"{datetime.now()}: Bought {qty} shares at {entry_price}")
+else:
+    holding_bars += 1
+    if check_exit_signal(entry_price, current_price, holding_bars, last_candle):
+        # Execute market sell
+        # Assuming full position exit
+        positions = trading_client.get_all_positions()
+        for pos in positions:
+            if pos.symbol == SYMBOL:
+                qty = int(pos.qty)
+                order = MarketOrderRequest(
+                    symbol=SYMBOL,
+                    qty=qty,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY
+                )
+                trading_client.submit_order(order)
+                print(f"{datetime.now()}: Sold {qty} shares at {current_price}")
+                position_open = False
+                entry_price = None
+                holding_bars = 0
+
+# -------------------------------
+# Add logging to CSV (example)
+# -------------------------------
+trade_log = pd.DataFrame([{
+    'time': datetime.now(),
+    'symbol': SYMBOL,
+    'position_open': position_open,
+    'entry_price': entry_price,
+    'current_price': current_price
+}])
+trade_log.to_csv('trade_log.csv', mode='a', index=False, header=False)
