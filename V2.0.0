@@ -1,0 +1,808 @@
+import pandas as pd
+import asyncio
+from datetime import datetime, timedelta, time, timezone
+from zoneinfo import ZoneInfo
+import os
+import json
+import csv
+import schwab
+from decimal import Decimal
+from schwab.utils import Utils
+
+os.chdir(r"S:\TRADING DESK\Traders Only\Victor\Python\Alpaca")
+STATE_FILE = "algo_state.json"
+
+# ================= CONFIG =================
+APP_KEY = 
+APP_SECRET = 
+CALLBACK_URL = "https://127.0.0.1:3737"
+TOKEN_PATH = r"S:\TRADING DESK\Traders Only\Victor\Python\Alpaca\token.json"
+TRADING_SYMBOL = "UPRO"
+
+TRADING_WINDOW_START = time(9, 30)
+TRADING_WINDOW_END = time(16, 0)
+CANDLE_WINDOW_START = time(9, 15)
+CANDLE_WINDOW_END = time(16, 0)
+EOD_START = time(15, 49)
+EOD_END = time(15, 59)
+
+# dynamic stop loss exists as a function with local variables, edit them in dynamic_stop_loss()
+MOMENTUM_STOP_LOSS = -0.01
+TAKE_PROFIT1 = 0.03
+TAKE_PROFIT2 = 0.05
+MIN_INCREASE = 0.18 # check for falling knife, only enter is last candle is up by at least this amount
+EOD_PNL = 0.008 # used for eod exit
+VOL_CHECK = 0.01  # sell conditions trigger when vol is low
+ORDER_QTY = 1
+
+MAX_INTRADAY_CANDLES = 2000
+consecutive_stop_losses = 0
+trading_halted = False
+prev_close = None
+last_displayed_close = None
+
+# ================= CLIENTS =================
+trading_client = None
+ET = ZoneInfo("America/New_York")
+FILL_LOG_FILE = "trade_fills.csv"
+POLL_LOG_FILE = "poll_log.csv"
+
+async def keep_token_alive():
+    while True:
+        try:
+            trading_client.get_account_numbers()
+        except Exception as e:
+            print(f"\n[TOKEN REFRESH ERROR] {type(e).__name__}: {e}")
+        await asyncio.sleep(1200)
+
+# ================= STATE =================
+intraday_df = pd.DataFrame(columns=["close"])
+
+live_price = None
+last_5m_close = None
+
+sma50 = None
+sma150 = None
+sma150_slope = None
+sma150_prev = None
+std35 = None
+raw_std35 = None # always displayed
+std_floor_pct = 0.0085 # min sd value used when vol is low, calculated as a percentage of price
+price_slope = None # used to adjust dynamic stop loss
+
+current_position = None
+entry_price = None
+entry_time = None
+entry_signal = None  # tracks SD_BUY vs MOMENTUM_BUY for stop loss selection
+entry_peak_price = None # used for trailing stop
+
+entry_std_multiplier = 1.2
+last_loss_trading_day = None
+trading_days_since_loss = 0
+cooldown_until = None
+
+last_signal = None 
+account_hash = None
+
+# ================= STATE SAVE/LOAD =================
+def save_state():
+    state = {
+        "entry_std_multiplier": entry_std_multiplier,
+        "cooldown_until": cooldown_until.isoformat() if cooldown_until else None,
+        "last_loss_trading_day": last_loss_trading_day.isoformat() if last_loss_trading_day else None,
+        "trading_days_since_loss": trading_days_since_loss,
+        "current_position": current_position,
+        "entry_price": entry_price,
+        "consecutive_stop_losses": consecutive_stop_losses,
+        "trading_halted": trading_halted,
+        "entry_signal": entry_signal,
+        "entry_peak_price": entry_peak_price
+    }
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+def load_state():
+    global entry_std_multiplier, cooldown_until
+    global last_loss_trading_day, trading_days_since_loss
+    global current_position, entry_price, consecutive_stop_losses, trading_halted
+    global entry_signal, entry_peak_price
+
+    if not os.path.exists(STATE_FILE):
+        return
+
+    with open(STATE_FILE, "r") as f:
+        state = json.load(f)
+
+    entry_std_multiplier = state.get("entry_std_multiplier", 1.2)
+
+    cooldown_str = state.get("cooldown_until")
+    cooldown_until = datetime.fromisoformat(cooldown_str) if cooldown_str else None
+
+    loss_day_str = state.get("last_loss_trading_day")
+    last_loss_trading_day = datetime.fromisoformat(loss_day_str).date() if loss_day_str else None
+
+    trading_days_since_loss = state.get("trading_days_since_loss", 0)
+
+    current_position = state.get("current_position")
+    entry_price = state.get("entry_price")
+    consecutive_stop_losses = state.get("consecutive_stop_losses", 0)
+    trading_halted = state.get("trading_halted", False)
+    entry_signal = state.get("entry_signal")
+    entry_peak_price = state.get("entry_peak_price")
+
+# ================= HALT CONDITIONS =================
+def check_halt_conditions(prev_close):
+    global trading_halted
+
+    if last_5m_close and prev_close:
+        daily_pnl = (last_5m_close - prev_close) / prev_close
+        if daily_pnl <= -0.08:
+            trading_halted = True
+            print(f"\n[HALT] Daily drop exceeded 8% — trading halted until restart")
+            return
+
+    if consecutive_stop_losses >= 3:
+        trading_halted = True
+        print(f"\n[HALT] 3 consecutive stop losses — trading halted until restart")
+
+# ================= PREV CLOSE =================
+def fetch_prev_close():
+    global prev_close
+    try:
+        resp = trading_client.get_price_history_every_day(TRADING_SYMBOL)
+        data = resp.json()
+        candles = data["candles"]
+        today = datetime.now(ET).date()
+        last_candle_date = datetime.fromtimestamp(candles[-1]["datetime"] / 1000, tz=ET).date()
+        if last_candle_date == today:
+            prev_close = float(candles[-2]["close"])
+        else:
+            prev_close = float(candles[-1]["close"])
+        print(f"Reference price (prev close): {prev_close:.2f}")
+    except Exception as e:
+        print(f"\n[PREV CLOSE ERROR] {e}")
+
+# ================= FILTER HOURS =================
+def filter_trading_hours(bars_df):
+    df = bars_df.copy()
+
+    if df.index.tz is None:
+        df.index = df.index.tz_localize(ET)
+    else:
+        df.index = df.index.tz_convert(ET)
+
+    mask = (
+        (df.index.time >= CANDLE_WINDOW_START) &
+        (df.index.time < CANDLE_WINDOW_END) &
+        (df.index.dayofweek < 5)
+    )
+    return df[mask]
+
+# ================= FILL LOGGING =================
+def log_trade(side, price, reason, qty=ORDER_QTY):
+    file_exists = os.path.exists(FILL_LOG_FILE)
+    now_et = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S")
+
+    with open(FILL_LOG_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["timestamp_et", "symbol", "side", "qty", "price", "reason"])
+        writer.writerow([now_et, TRADING_SYMBOL, side.upper(), qty, f"{price:.2f}", reason])
+
+    print()
+    print(f"[TRADE LOG] {now_et} | {side.upper()} {qty}x {TRADING_SYMBOL} @ {price:.2f} | Reason: {reason}")
+
+# ================= POLL LOGGING =================
+def log_poll():
+    file_exists = os.path.exists(POLL_LOG_FILE)
+    now_et = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S")
+
+    close_val = last_5m_close
+
+    pnl_pct = None
+    if current_position == "long" and entry_price and close_val:
+        pnl_pct = round((close_val - entry_price) / entry_price * 100, 4)
+
+    in_window = TRADING_WINDOW_START <= datetime.now(ET).time() <= TRADING_WINDOW_END
+    in_eod = EOD_START <= datetime.now(ET).time() <= EOD_END
+    cool = cooldown_until.strftime("%Y-%m-%d %H:%M:%S") if cooldown_until and datetime.now(ET) < cooldown_until else "OFF"
+    min_std = round(close_val * std_floor_pct, 4) if close_val else None
+    floor_active = raw_std35 is not None and min_std is not None and raw_std35 < min_std
+
+    with open(POLL_LOG_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow([
+                "timestamp_et", "close", "live_price", "sma50", "sma150",
+                "sd35_raw", "sd35_used", "sd35_floor_active", "lower_band", "upper_band",
+                "position", "entry_price", "pnl_pct", "multiplier",
+                "in_window", "in_eod", "cooldown", "entry_signal", "peak_price"
+            ])
+
+        lb = round(min(sma50, sma150) - (entry_std_multiplier * std35), 4) if sma50 and sma150 and std35 else None
+        ub = round(max(sma50, sma150) + (0.6 * std35), 4) if sma50 and sma150 and std35 else None
+
+        writer.writerow([
+            now_et,
+            round(close_val, 4),
+            round(live_price, 4) if live_price else None,
+            round(sma50, 4) if sma50 else None,
+            round(sma150, 4) if sma150 else None,
+            round(raw_std35, 4) if raw_std35 else None,
+            round(std35, 4) if std35 else None,
+            floor_active,
+            lb, ub,
+            current_position,
+            entry_price,
+            pnl_pct,
+            entry_std_multiplier,
+            in_window,
+            in_eod,
+            cool,
+            entry_signal,
+            round(entry_peak_price, 4) if entry_peak_price else None
+        ])
+
+# ================= PRELOAD INTRADAY =================
+def preload_intraday():
+    global intraday_df, last_5m_close
+
+    resp = trading_client.get_price_history_every_five_minutes(
+        TRADING_SYMBOL,
+        start_datetime=datetime.now(ET) - timedelta(days=5),
+        end_datetime=datetime.now(ET),
+        need_extended_hours_data=True
+    )
+
+    data = resp.json()
+    candles = data["candles"]
+
+    times = [datetime.fromtimestamp(c["datetime"] / 1000, tz=ET) for c in candles]
+    closes = [c["close"] for c in candles]
+
+    bars_df = pd.DataFrame({"close": closes}, index=pd.DatetimeIndex(times))
+    bars_df = filter_trading_hours(bars_df)
+
+    intraday_df = bars_df[["close"]].copy()
+    intraday_df["close"] = pd.to_numeric(intraday_df["close"])
+    intraday_df = intraday_df.tail(MAX_INTRADAY_CANDLES)
+
+    last_5m_close = intraday_df["close"].iloc[-1]
+
+    print(f"Preloaded {len(intraday_df)} candles")
+
+    if len(intraday_df) >= 150:
+        compute_intraday_indicators()
+        print(f"Indicators ready on startup — SMA50:{sma50:.2f} SMA150:{sma150:.2f} SD35:{raw_std35:.2f}")
+    else:
+        print(f"Warning: only {len(intraday_df)} candles preloaded, need 150 for indicators")
+
+# ================= POLL 5-MIN HISTORICAL =================
+async def poll_5min_bars():
+    global intraday_df, last_5m_close, last_displayed_close
+
+    while live_price is None:
+        await asyncio.sleep(1)
+
+    while True:
+        try:
+            resp = trading_client.get_price_history_every_five_minutes(
+                TRADING_SYMBOL,
+                start_datetime=datetime.now(ET) - timedelta(days=5),
+                end_datetime=datetime.now(ET),
+                need_extended_hours_data=True
+            )
+
+            data = resp.json()
+            candles = data["candles"]
+
+            times = [datetime.fromtimestamp(c["datetime"] / 1000, tz=ET) for c in candles]
+            closes = [c["close"] for c in candles]
+
+            bars_df = pd.DataFrame({"close": closes}, index=pd.DatetimeIndex(times))
+            bars_df = filter_trading_hours(bars_df)
+
+            new_df = bars_df[["close"]].copy()
+            new_df["close"] = pd.to_numeric(new_df["close"])
+            intraday_df = new_df.tail(MAX_INTRADAY_CANDLES)
+
+            last_5m_close = intraday_df["close"].iloc[-1]
+
+            if len(intraday_df) >= 150 and compute_intraday_indicators():
+                df_snapshot = intraday_df.copy()
+                update_multiplier_state()
+                trade_logic(df_snapshot)
+                save_state()
+                log_poll()
+                last_displayed_close = last_5m_close
+
+            print_status()
+
+        except Exception as e:
+            err_str = str(e).lower()
+            if any(x in err_str for x in ["token_invalid", "401", "unauthorized", "token expired", "invalid token"]):
+                print(f"\n[TOKEN EXPIRED] Re-authentication required — shutting down")
+                os._exit(1)
+            import traceback
+            print(f"\n[POLLING ERROR] Type: {type(e).__name__} | Message: {e}")
+            traceback.print_exc()
+
+        now = datetime.now(ET)
+        seconds_past = (now.minute % 5) * 60 + now.second + now.microsecond / 1e6
+        sleep_seconds = 300 - seconds_past + 5
+        await asyncio.sleep(sleep_seconds)
+
+# ================= POSITION SYNC =================
+def get_last_fill_price():
+    if not os.path.exists(FILL_LOG_FILE):
+        return None
+    try:
+        with open(FILL_LOG_FILE, "r") as f:
+            reader = csv.DictReader(f)
+            rows = [r for r in reader if r["side"].strip().upper() == "BUY"]
+            if rows:
+                return float(rows[-1]["price"])
+    except Exception as e:
+        print(f"\n[FILL LOG ERROR] {e}")
+    return None
+
+def sync_position():
+    global current_position, entry_price
+
+    try:
+        resp = trading_client.get_account(
+            account_hash,
+            fields=schwab.client.Client.Account.Fields.POSITIONS
+        )
+        data = resp.json()
+        positions = data.get("securitiesAccount", {}).get("positions", [])
+
+        found = False
+        for pos in positions:
+            instrument = pos.get("instrument", {})
+            if instrument.get("symbol") == TRADING_SYMBOL:
+                current_position = "long"
+
+                fill_price = get_last_fill_price()
+                if fill_price:
+                    entry_price = fill_price
+                    print(f"Synced LONG @ {entry_price:.2f} (from fill log)")
+                else:
+                    entry_price = float(pos.get("averageLongPrice") or pos["averagePrice"])
+                    print(f"Synced LONG @ {entry_price:.2f} (from Schwab — no fill log found)")
+
+                found = True
+                break
+
+        if not found:
+            current_position = None
+            entry_price = None
+            print("No open position.")
+
+    except Exception as e:
+        current_position = None
+        entry_price = None
+        print(f"Position sync error: {e}")
+
+    save_state()
+
+# ================= INDICATORS =================
+def compute_intraday_indicators():
+    global sma50, sma150, std35, raw_std35, sma150_slope, sma150_prev, price_slope
+
+    if len(intraday_df) < 150:
+        return False
+
+    closes = intraday_df["close"]
+
+    sma50 = closes.rolling(50).mean().iloc[-1]
+    sma150_series = closes.rolling(150).mean()
+    sma150 = sma150_series.iloc[-1]
+    sma150_prev = sma150_series.iloc[-2]
+    std35 = closes.rolling(35).std().iloc[-1]
+    raw_std35 = std35
+    sma150_slope = sma150_series.iloc[-1] - sma150_series.iloc[-4]
+    price_slope = closes.iloc[-1] - closes.iloc[-5]
+
+    min_std = last_5m_close * std_floor_pct
+    if std35 < min_std:
+        std35 = min_std
+
+    return True
+
+# ================= MULTIPLIER =================
+def update_multiplier_state():
+    global entry_std_multiplier, trading_days_since_loss, last_loss_trading_day
+
+    if last_loss_trading_day is None:
+        return
+
+    today = datetime.now(ET).date()
+
+    if today > last_loss_trading_day:
+        if not hasattr(update_multiplier_state, "_last_processed_day") or \
+                update_multiplier_state._last_processed_day != today:
+
+            update_multiplier_state._last_processed_day = today
+            trading_days_since_loss += 1
+            last_loss_trading_day = today
+
+            if trading_days_since_loss == 1:
+                entry_std_multiplier = 1.3
+            elif trading_days_since_loss >= 2:
+                entry_std_multiplier = 1.2
+
+            save_state()
+
+# ================= DISPLAY =================
+def print_status():
+    lp = f"{live_price:.2f}" if live_price is not None else "-"
+    lc = f"{last_5m_close:.2f}" if last_5m_close is not None else "-"
+
+    s50 = f"{sma50:.2f}" if pd.notna(sma50) else "-"
+    s150 = f"{sma150:.2f}" if pd.notna(sma150) else "-"
+
+    if pd.notna(sma50) and pd.notna(sma150) and pd.notna(std35):
+        lower_band = min(sma50, sma150) - (entry_std_multiplier * std35)
+        upper_band = max(sma50, sma150) + (0.6 * std35)
+        lb = f"{lower_band:.2f}"
+        ub = f"{upper_band:.2f}"
+    else:
+        lb = "-"
+        ub = "-"
+
+    now_et = datetime.now(ET).strftime("%H:%M:%S")
+    cool_display = cooldown_until.strftime("%H:%M:%S") if cooldown_until and datetime.now(ET) < cooldown_until else "OFF"
+
+    std = f"{raw_std35:.2f}" if raw_std35 is not None and pd.notna(raw_std35) else "-"
+    floor_display = f" [SD Floor:{std35:.2f}]" if raw_std35 is not None and raw_std35 < last_5m_close * std_floor_pct else ""
+
+    slope = f"{sma150_slope:.2f}" if sma150_slope is not None and pd.notna(sma150_slope) else "-"
+
+    print(
+        f"\r[{now_et}] Px:{lp} | Close:{lc} | MA50:{s50} | MA150:{s150} | Slope(MA150):{slope} | SD35:{std} | "
+        f"LB:{lb} | UB:{ub} | Mult:{entry_std_multiplier} | CD:{cool_display} | "
+        f"Days:{trading_days_since_loss}{floor_display}",
+        end="", flush=True
+    )
+# ================= ORDER =================
+def conditions_still_met(side, initial_price):
+    close_price = live_price if live_price is not None else last_5m_close
+
+    if side == "buy":
+        return close_price <= initial_price * 1.0025
+    elif side == "sell":
+        return close_price >= initial_price * 0.9975
+    return False
+
+
+def place_limit_order(side, reason):
+    global current_position, entry_price, entry_time, last_signal, entry_peak_price
+    last_signal = reason
+    initial_price = live_price if live_price is not None else last_5m_close
+
+    import time as time_mod
+
+    if side == "sell" and current_position is None:
+        print(f"\n[SAFETY] No position to sell — aborting")
+        return False
+
+    if side == "buy":
+        try:
+            resp = trading_client.get_account(
+                account_hash,
+                fields=schwab.client.Client.Account.Fields.POSITIONS
+            )
+            data = resp.json()
+            positions = data.get("securitiesAccount", {}).get("positions", [])
+            for pos in positions:
+                if pos.get("instrument", {}).get("symbol") == TRADING_SYMBOL:
+                    actual_qty = float(pos.get("longQuantity", 0))
+                    if actual_qty > 0:
+                        print(f"\n[SAFETY] Already holding {actual_qty} shares — aborting buy")
+                        return False
+        except Exception as e:
+            print(f"\n[SAFETY CHECK ERROR] {e} — aborting buy to be safe")
+            return False
+
+    retry_count = 0
+    while retry_count < 5:
+        if trading_halted:
+            print(f"\n[RETRY ABORTED] Trading halted")
+            return False
+
+        if side == "sell" and current_position is None:
+            return False
+
+        if side == "buy" and current_position is not None:
+            return False
+
+        now_dt = datetime.now(ET)
+        if not (TRADING_WINDOW_START <= now_dt.time() <= TRADING_WINDOW_END):
+            print(f"\n[RETRY ABORTED] Outside trading window")
+            return False
+
+        if cooldown_until and now_dt < cooldown_until:
+            print(f"\n[RETRY ABORTED] In cooldown")
+            return False
+
+        if not conditions_still_met(side, initial_price):
+            print(f"\n[RETRY ABORTED] Price moved 0.5% from initial — {reason}")
+            return False
+
+        price = live_price if live_price is not None else last_5m_close
+
+        if price is None:
+            print(f"\n[ORDER SKIPPED] No price available for {side.upper()} — {reason}")
+            return False
+
+        if side == "buy":
+            limit = str(round(price * 1.001, 2))
+        else:
+            limit = str(round(price * 0.999, 2))
+
+        order = schwab.orders.equities.equity_buy_limit(
+            symbol=TRADING_SYMBOL,
+            quantity=ORDER_QTY,
+            price=limit
+        ).set_duration(schwab.orders.common.Duration.FILL_OR_KILL) \
+         .set_session(schwab.orders.common.Session.NORMAL) \
+         .build() if side == "buy" else \
+        schwab.orders.equities.equity_sell_limit(
+            symbol=TRADING_SYMBOL,
+            quantity=ORDER_QTY,
+            price=limit
+        ).set_duration(schwab.orders.common.Duration.FILL_OR_KILL) \
+         .set_session(schwab.orders.common.Session.NORMAL) \
+         .build()
+
+        try:
+            resp = trading_client.place_order(account_hash, order)
+            order_id = Utils(trading_client, account_hash).extract_order_id(resp)
+
+            time_mod.sleep(1)
+
+            order_resp = trading_client.get_order(order_id, account_hash)
+            order_status = order_resp.json()
+            status = order_status.get("status")
+            print(f"\n[ORDER STATUS] {status}")
+
+            if status == "FILLED":
+                try:
+                    filled_price = float(
+                        order_status["orderActivityCollection"][0]["executionLegs"][0]["price"]
+                    )
+                except (KeyError, IndexError, TypeError):
+                    filled_price = float(order_status.get("price", price))
+
+                try:
+                    log_trade(side, filled_price, reason)
+                except Exception as e:
+                    print(f"\n[LOG ERROR] Could not write to fill log: {e}")
+
+                if side == "buy":
+                    current_position = "long"
+                    entry_price = filled_price
+                    entry_time = datetime.now(ET)
+                    entry_peak_price = filled_price
+                else:
+                    current_position = None
+                    entry_price = None
+                    entry_time = None
+                    entry_peak_price = None
+
+                save_state()
+                print(f"\n[FILLED] {side.upper()} {ORDER_QTY}x @ {filled_price:.2f} | {reason}")
+                return True
+
+            elif status == "REJECTED":
+                print(f"\n[ORDER REJECTED]  {reason}")
+                return False
+
+            else:
+                retry_count += 1
+                print(f"\n[FOK KILLED] {side.upper()} not filled — retry {retry_count}/5 | {reason}")
+                time_mod.sleep(2)
+
+        except Exception as e:
+            retry_count += 1
+            print(f"\n[ORDER ERROR] {e} — retry {retry_count}/5")
+            time_mod.sleep(2)
+
+    print(f"\n[MAX RETRIES] Aborting after 5 attempts — {reason}")
+    return False
+
+# ================= STRATEGY =================
+def dynamic_stop_loss():
+    base_stop = 0.018
+    floor_stop = 0.0075
+
+    if raw_std35 is None or last_5m_close is None or price_slope is None:
+        return base_stop
+
+    vol_pct = raw_std35 / last_5m_close
+
+    if vol_pct <= 0.01 or price_slope >= 0:
+        return base_stop
+
+    vol_factor = min((vol_pct - 0.008) / 0.02, 1.0) # maxes out at 3% of price, 0 when below 0.8%
+    slope_factor = min(abs(price_slope) / (last_5m_close * 0.01), 1.0)  # maxes at 1.0% price drop over 5 candles
+    # to scale a factor, first figure out what is the max amount you want to allow, in relations to price.
+    # For example, if you want to max out at 0.05(5%) you would make the base price*0.05, set min to 1.0, so anything above max is set at 1.0
+    combined = (vol_factor + slope_factor) / 2
+    stop = base_stop - combined * (base_stop - floor_stop)
+    return round(stop, 4)
+
+def trade_logic(df_snapshot):
+    global cooldown_until, last_loss_trading_day, trading_days_since_loss
+    global entry_std_multiplier, consecutive_stop_losses, trading_halted, entry_signal, entry_peak_price
+
+    now_dt = datetime.now(ET)
+    now = now_dt.time()
+
+    if trading_halted:
+        return
+
+    if not (TRADING_WINDOW_START <= now <= TRADING_WINDOW_END):
+        return
+
+    if cooldown_until and now_dt < cooldown_until:
+        return
+
+    close_price = last_5m_close
+
+    if current_position is not None and entry_price is not None:
+        
+        if entry_peak_price is None or close_price > entry_peak_price:
+            entry_peak_price = close_price
+
+        peak_pnl_pct = (entry_peak_price - entry_price) / entry_price
+        pnl_pct = (close_price - entry_price) / entry_price
+
+        if peak_pnl_pct >= 0.01 and close_price > min(sma50, sma150):
+            trailing_multiplier = 0.9977 if peak_pnl_pct >= 0.05 else 0.996  # trailing stop gets tighter with highe profits
+            trailing_stop_price = entry_peak_price * trailing_multiplier
+            if close_price <= trailing_stop_price:
+                if place_limit_order("sell", "TRAILING_STOP"):
+                    consecutive_stop_losses = 0
+                    entry_signal = None
+                    entry_peak_price = None
+                    save_state()
+                return
+        
+        # Use tighter stop for momentum entries
+        active_stop = MOMENTUM_STOP_LOSS if entry_signal == "MOMENTUM_BUY" else -dynamic_stop_loss()
+        if pnl_pct <= active_stop:
+            if place_limit_order("sell", "STOP_LOSS"):
+                cooldown_until = now_dt + timedelta(minutes=20)
+                last_loss_trading_day = now_dt.date()
+                trading_days_since_loss = 0
+                entry_std_multiplier = 1.4
+                consecutive_stop_losses += 1
+                entry_signal = None
+                entry_peak_price = None
+                check_halt_conditions(prev_close)
+                save_state()
+            return
+        
+        if pnl_pct >= TAKE_PROFIT2 and raw_std35 < last_5m_close * VOL_CHECK:
+            if place_limit_order("sell", "TAKE_PROFIT2"):
+                consecutive_stop_losses = 0
+                entry_signal = None
+                entry_peak_price = None
+                save_state()
+            return
+        
+        if pnl_pct >= TAKE_PROFIT1 and close_price > min(sma50, sma150) and raw_std35 < last_5m_close * VOL_CHECK:
+            if place_limit_order("sell", "TAKE_PROFIT1"):
+                consecutive_stop_losses = 0
+                entry_signal = None
+                entry_peak_price = None
+                save_state()
+            return
+
+        if EOD_START <= now <= EOD_END and pnl_pct > EOD_PNL and raw_std35 < last_5m_close * 0.008:
+            if place_limit_order("sell", "EOD_PROFIT"):
+                consecutive_stop_losses = 0
+                entry_signal = None
+                entry_peak_price = None
+                save_state()
+            return
+
+        upper_band = max(sma50, sma150) + (1.2 * std35)
+        if entry_signal != "MOMENTUM_BUY" and close_price > upper_band:
+            if place_limit_order("sell", "SD_SELL"):
+                consecutive_stop_losses = 0
+                entry_signal = None
+                entry_peak_price = None
+                save_state()
+            return
+
+    if current_position is None:
+        # --- SD_BUY ---
+        lower_ma = min(sma50, sma150)
+        dynamic_lower_band = lower_ma - (entry_std_multiplier * std35)
+
+        if close_price < dynamic_lower_band:
+            if len(df_snapshot) >= 2:
+                d_close = Decimal(str(last_5m_close))
+                d_prev = Decimal(str(df_snapshot["close"].iloc[-2] if last_displayed_close is None else last_displayed_close))
+                d_min = Decimal(str(MIN_INCREASE))
+                if d_close - d_prev > d_min:
+                    if place_limit_order("buy", "SD_BUY"):
+                        entry_signal = "SD_BUY"
+                        save_state()
+            return  # always return after SD_BUY block regardless of fill
+
+        # --- MOMENTUM_BUY ---
+        prev_close_candle = last_displayed_close if last_displayed_close is not None else df_snapshot["close"].iloc[-2]
+        if sma150_slope is not None and sma150_slope < 0 and sma150_prev is not None and len(df_snapshot) >= 2 and sma50 < sma150:
+            sma150_just_crossed = sma150_prev >= prev_close_candle and sma150 < close_price
+            if sma150_just_crossed:
+                if place_limit_order("buy", "MOMENTUM_BUY"):
+                    entry_signal = "MOMENTUM_BUY"
+                    save_state()
+                return
+
+# ================= STREAM =================
+async def handle_trade(data):
+    global live_price
+    for item in data.get("content", []):
+        if item.get("key") == TRADING_SYMBOL:
+            price = item.get("LAST_PRICE")
+            if price:
+                live_price = float(price)
+                print_status()
+
+# ================= MAIN =================
+if __name__ == "__main__":
+    trading_client = schwab.auth.easy_client(
+        api_key=APP_KEY,
+        app_secret=APP_SECRET,
+        callback_url=CALLBACK_URL,
+        token_path=TOKEN_PATH
+    )
+    resp = trading_client.get_account_numbers()
+    accounts = resp.json()
+    account_hash = accounts[0]['hashValue']
+
+    resp = trading_client.get_account(
+        account_hash,
+        fields=schwab.client.Client.Account.Fields.POSITIONS
+    )
+    data = resp.json()
+
+    load_state()
+    trading_halted = False  # always reset halt on manual restart
+    sync_position()
+    preload_intraday()
+    fetch_prev_close()
+
+    async def run_stream():
+        while True:
+            try:
+                stream_client = schwab.streaming.StreamClient(trading_client, account_id=account_hash)
+                await stream_client.login()
+
+                await stream_client.level_one_equity_subs(
+                    [TRADING_SYMBOL],
+                    fields=[schwab.streaming.StreamClient.LevelOneEquityFields.LAST_PRICE]
+                )
+                stream_client.add_level_one_equity_handler(handle_trade)
+                print(f"\n[STREAM] Connected @ {datetime.now(ET).strftime('%H:%M:%S')}")
+
+                while True:
+                    await stream_client.handle_message()
+
+            except Exception as e:
+                print(f"\n[STREAM] Unexpected error: {type(e).__name__}: {e} — reconnecting in 5s")
+                await asyncio.sleep(5)
+
+    async def main():
+        await asyncio.gather(
+            run_stream(),
+            poll_5min_bars(),
+            keep_token_alive()
+        )
+
+    asyncio.run(main())
