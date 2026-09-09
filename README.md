@@ -1,29 +1,25 @@
-# Alpaca Requirements Recap
+# Bot Summary
 
-Ticker: TQQQ
+Ticker: UPRO
 
-Timeframe: 15-min candles
+Timeframe: 5-min candles
 
 Position limit: 1 open position at a time
 
-Position size: 7.5% of account equity
+Position size: 1 Share
 
-Entry(meet all reqs):
+Entry:
 
-1. Price 4% below 24-hour high
+1. Price below lower band as determined by SD and candle is rising
 
-2. close < SMA(20) - 1.5 * rolling_std(20)
-
-3. RSI(14) ≤ 40 AND RSI_now ≥ RSI_prev
+2. Price is rising above SMA while SMA in downtrend
 
 Exit:
 
-Take profit: +3% OR close ≥ SMA(20) + 0.5*rolling_std(20)
+Take profit: +3% or +5% based on volatility and technical signals
 
-Stop loss: -1.25%
+Trailing stop: take profit if price declines to a percentage during profit
 
-Time stop: 20 candles (~2 hours)
+Stop loss: from 1.8% to 0.75% depending on volatility
 
-Paper trading: Alpaca free tier REST API
 
-Trade journal: CSV logging
