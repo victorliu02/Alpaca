@@ -9,14 +9,14 @@ import schwab
 from decimal import Decimal
 from schwab.utils import Utils
 
-os.chdir(r"S:\TRADING DESK\Traders Only\Victor\Python\Alpaca")
+os.chdir(r"")
 STATE_FILE = "algo_state.json"
 
 # ================= CONFIG =================
 APP_KEY = 
 APP_SECRET = 
-CALLBACK_URL = "https://127.0.0.1:3737"
-TOKEN_PATH = r"S:\TRADING DESK\Traders Only\Victor\Python\Alpaca\token.json"
+CALLBACK_URL = 
+TOKEN_PATH = 
 TRADING_SYMBOL = "UPRO"
 
 TRADING_WINDOW_START = time(9, 30)
