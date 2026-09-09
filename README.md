@@ -16,10 +16,10 @@ Entry:
 
 Exit:
 
-Take profit: +3% or +5% based on volatility and technical signals
+1. Take profit: +3% or +5% based on volatility and technical signals
 
-Trailing stop: take profit if price declines to a percentage during profit
+2. Trailing stop: take profit if price declines to a percentage during profit
 
-Stop loss: from 1.8% to 0.75% depending on volatility
+3. Stop loss: from 1.8% to 0.75% depending on volatility
 
 
